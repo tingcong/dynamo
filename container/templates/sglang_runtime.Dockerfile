@@ -54,6 +54,7 @@ RUN apt-get update && \
         gpgsm \
         gpgv \
         keyboxd \
+        libbrotli1 \
         libssl3t64 \
         openssl && \
     rm -rf /var/lib/apt/lists/* && \
@@ -213,11 +214,13 @@ RUN --mount=type=bind,source=./container/deps/requirements.sglang.txt,target=/tm
 # Assert what the install left. The pin is repeated from the requirements file
 # on purpose; a test asserts the two agree.
 RUN --mount=type=bind,source=./container/compliance,target=/tmp/compliance/compliance \
-    PYTHONPATH=/tmp/compliance python3 -m compliance.check_pynvvideocodec --pinned 2.2.3
+    PYTHONPATH=/tmp/compliance python3 -m compliance.check_pynvvideocodec --pinned 2.2.4
 {% else %}
 # mooncake and PyNvVideoCodec are CUDA-only. The mooncake floor names the CUDA 13
 # distribution, and PyNvVideoCodec decodes on NVDEC through libnvcuvid, so both
-# are inert on the XPU image and neither is present in its base. The patterns are
+# are inert on the XPU image and neither is present in its base. The diffusers pin
+# is stripped too: the XPU framework stage installs its own diffusion extra, and
+# this pin is tested on CUDA only. The patterns are
 # anchored to the line start so they cannot match inside another requirement, and
 # the checks fail the build if either package arrives by another route -- a filter
 # that silently stopped matching would otherwise look like success. Both checks
@@ -230,7 +233,7 @@ RUN --mount=type=bind,source=./container/compliance,target=/tmp/compliance/compl
 RUN --mount=type=bind,source=./container/deps/requirements.sglang.txt,target=/tmp/requirements.sglang.txt \
     --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     export PIP_CACHE_DIR=/root/.cache/pip && \
-    grep -v -e '^PyNvVideoCodec' -e '^mooncake-transfer-engine-cuda13' \
+    grep -v -e '^PyNvVideoCodec' -e '^mooncake-transfer-engine-cuda13' -e '^diffusers' \
         /tmp/requirements.sglang.txt > /tmp/requirements.sglang.nonvidia.txt && \
     pip install --break-system-packages --force-reinstall --no-deps \
         --requirement /tmp/requirements.sglang.nonvidia.txt && \
@@ -312,6 +315,48 @@ RUN set -eux; \
         -o -name 'libfaac*.so*' -o -name 'libvo-aacenc*.so*' \
         -o -name 'libaacplus*.so*' \) -delete; \
     ldconfig
+{% endif %}
+
+{% if device == "cuda" %}
+# Move the image from the Ubuntu python3.12 packages to a uv-managed CPython
+# 3.12.16, the layout of later upstream SGLang images. The /opt/sglang venv keeps
+# its site-packages and points at the 3.12 minor-version link, which a later 3.12
+# patch install moves. The Ubuntu packages are then purged, and /usr/bin/python and
+# /usr/bin/python3 become the wrapper upstream ships. The uv in
+# context.dynamo.uv_version predates this CPython build, so this step runs a pinned
+# uv from a bind mount, without the shared uv cache.
+#
+# Keep this step after every apt-get call. A package that depends on python3
+# brings the Ubuntu interpreter back, and the --auto-remove of the purge above
+# would also remove the libraries that only the Ubuntu interpreter pulled in.
+RUN --mount=type=bind,from=ghcr.io/astral-sh/uv:0.13.6,source=/,target=/tmp/uv-python \
+    set -eu; \
+    export UV_NO_CACHE=1 UV_PYTHON_INSTALL_DIR=/opt/python; \
+    /tmp/uv-python/uv python install --no-bin 3.12.16; \
+    /tmp/uv-python/uv venv --allow-existing --managed-python --python 3.12 /opt/sglang; \
+    check='import sys; print(sys.argv[1], sys.version.split()[0], sys.prefix); sys.exit(0 if sys.version_info[:3] == (3, 12, 16) and sys.prefix == "/opt/sglang" else 1)'; \
+    /opt/sglang/bin/python -c "$check" /opt/sglang/bin/python; \
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y \
+        libpython3.12-minimal \
+        libpython3.12-stdlib \
+        libpython3.12t64 \
+        python3-pip-whl \
+        python3-setuptools-whl \
+        python3.12 \
+        python3.12-minimal; \
+    update-alternatives --remove-all python3; \
+    rm -f /usr/bin/python /usr/bin/python3; \
+    printf '#!/bin/sh\nexec /opt/sglang/bin/python "$@"\n' > /usr/bin/python3; \
+    chmod 0755 /usr/bin/python3; \
+    cp -p /usr/bin/python3 /usr/bin/python; \
+    for py in /usr/bin/python3 /usr/bin/python; do \
+        "$py" -c "$check" "$py"; \
+    done; \
+    test ! -e /usr/lib/python3.12; \
+    if dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' | grep -E '^ii +[^ ]*python3'; then \
+        echo "ERROR: Ubuntu Python packages remain" >&2; \
+        exit 1; \
+    fi
 {% endif %}
 
 # Drop the Nsight efa_metrics plugin the CUDA floor carries: a Go NIC sampler
